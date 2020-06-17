@@ -13,14 +13,18 @@ from ops.spectral_norm import spectral_norm as SpectralNorm
 class ResidualBlock(nn.Module):
     """Residual Block."""
 
-    def __init__(self, dim_in, dim_out):
+    def __init__(self, dim_in, dim_out, net_mode=None):
         super(ResidualBlock, self).__init__()
+        if net_mode == 'MDNet' or (net_mode is None):
+            use_affine = True
+        elif net_mode == 'MANet':
+            use_affine = False
         self.main = nn.Sequential(
             nn.Conv2d(dim_in, dim_out, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.InstanceNorm2d(dim_out, affine=True),
+            nn.InstanceNorm2d(dim_out, affine=use_affine),
             nn.ReLU(inplace=True),
             nn.Conv2d(dim_out, dim_out, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.InstanceNorm2d(dim_out, affine=True))
+            nn.InstanceNorm2d(dim_out, affine=use_affine))
 
     def forward(self, x):
         return x + self.main(x)
@@ -137,14 +141,11 @@ class VGG(nn.Module):
 class Generator(nn.Module):
     """Generator. Encoder-Decoder Architecture."""
 
-    def __init__(self, conv_dim=64, repeat_num=6):
+    def __init__(self, conv_dim=64):
         super(Generator, self).__init__()
 
-        encoder_layers = []
-        encoder_layers.append(nn.Conv2d(3, conv_dim, kernel_size=7, stride=1, padding=3, bias=False))
-        # MANet设置没有affine
-        encoder_layers.append(nn.InstanceNorm2d(conv_dim, affine=False))
-        encoder_layers.append(nn.ReLU(inplace=True))
+        encoder_layers = [nn.Conv2d(3, conv_dim, kernel_size=7, stride=1, padding=3, bias=False),
+                          nn.InstanceNorm2d(conv_dim, affine=False), nn.ReLU(inplace=True)]
 
         # Down-Sampling
         curr_dim = conv_dim
@@ -156,11 +157,11 @@ class Generator(nn.Module):
 
         # Bottleneck
         for i in range(3):
-            encoder_layers.append(ResidualBlock(dim_in=curr_dim, dim_out=curr_dim))
+            encoder_layers.append(ResidualBlock(dim_in=curr_dim, dim_out=curr_dim, net_mode='MANet'))
 
         decoder_layers = []
         for i in range(3):
-            decoder_layers.append(ResidualBlock(dim_in=curr_dim, dim_out=curr_dim))
+            decoder_layers.append(ResidualBlock(dim_in=curr_dim, dim_out=curr_dim, net_mode='MANet'))
 
         # Up-Sampling
         for i in range(2):
@@ -178,10 +179,10 @@ class Generator(nn.Module):
         self.MDNet = MDNet()
         self.AMM = AMM()
 
-    def forward(self, source_image, reference_image):
+    def forward(self, source_image, reference_image, mask_source, mask_ref, rel_pos_source, rel_pos_ref):
         fm_source = self.encoder(source_image)
         fm_reference = self.MDNet(reference_image)
-        morphed_fm = self.AMM(fm_source, fm_reference)
+        morphed_fm = self.AMM(fm_source, fm_reference, mask_source, mask_ref, rel_pos_source, rel_pos_ref)
         result = self.decoder(morphed_fm)
         return result
 
@@ -190,13 +191,11 @@ class MDNet(nn.Module):
     """Generator. Encoder-Decoder Architecture."""
 
     # MDNet is similar to the encoder of StarGAN
-    def __init__(self, conv_dim=64, repeat_num=3):
+    def __init__(self, conv_dim=64):
         super(MDNet, self).__init__()
 
-        layers = []
-        layers.append(nn.Conv2d(3, conv_dim, kernel_size=7, stride=1, padding=3, bias=False))
-        layers.append(nn.InstanceNorm2d(conv_dim, affine=True))
-        layers.append(nn.ReLU(inplace=True))
+        layers = [nn.Conv2d(3, conv_dim, kernel_size=7, stride=1, padding=3, bias=False),
+                  nn.InstanceNorm2d(conv_dim, affine=True), nn.ReLU(inplace=True)]
 
         # Down-Sampling
         curr_dim = conv_dim
@@ -207,8 +206,8 @@ class MDNet(nn.Module):
             curr_dim = curr_dim * 2
 
         # Bottleneck
-        for i in range(repeat_num):
-            layers.append(ResidualBlock(dim_in=curr_dim, dim_out=curr_dim))
+        for i in range(3):
+            layers.append(ResidualBlock(dim_in=curr_dim, dim_out=curr_dim, net_mode='MDNet'))
         self.main = nn.Sequential(*layers)
 
     def forward(self, reference_image):
@@ -216,9 +215,7 @@ class MDNet(nn.Module):
         return fm_reference
 
 
-# AMM暂时先不用landmark detector，先试试一般的attention效果如何
-# feature map也先不乘以visual_feature_weight
-# 这里attention部分的计算也先存疑，因为论文中提到x和y需要是同一个区域，但结构图中是softmax
+# AMM参考 PSGAN 官方代码进行了修改
 class AMM(nn.Module):
     """Attentive Makeup Morphing module"""
 
@@ -229,30 +226,83 @@ class AMM(nn.Module):
         self.beta_matrix_conv = nn.Conv2d(in_channels=256, out_channels=1, kernel_size=1)
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, fm_source, fm_reference):
-        batch_size, channels, width, height = fm_reference.size()
-        old_lambda_matrix = self.lambda_matrix_conv(fm_reference).view(batch_size, -1, width * height)
-        old_beta_matrix = self.beta_matrix_conv(fm_reference).view(batch_size, -1, width * height)
+    @staticmethod
+    def get_attention_map(mask_source, mask_ref, fm_source, fm_reference, rel_pos_source, rel_pos_ref):
+        HW = 64 * 64
+        batch_size = 3
 
-        # reshape后fm的形状是C*(H*W)
-        temp_fm_reference = fm_reference.view(batch_size, -1, height * width)
-        # print('temp_fm_reference shape: ', temp_fm_reference.shape)
-        # fm_source 在reshape后需要transpose成(H*W)*C
-        temp_fm_source = fm_source.view(batch_size, -1, height * width).permute(0, 2, 1)
-        # print('temp_fm_source shape: ', temp_fm_source.shape)
-        # energy的形状应该是N*N，N=H*W
-        energy = torch.bmm(temp_fm_source, temp_fm_reference)
-        attention_map = self.softmax(energy)
+        # get 3 part fea using mask
+        channels = fm_reference.shape[1]
 
-        new_lambda_matrix = torch.bmm(old_lambda_matrix, attention_map.permute(0, 2, 1))
-        new_beta_matrix = torch.bmm(old_beta_matrix, attention_map.permute(0, 2, 1))
-        new_lambda_matrix = new_lambda_matrix.view(batch_size, 1, width, height)
-        new_beta_matrix = new_beta_matrix.view(batch_size, 1, width, height)
+        mask_source_re = F.interpolate(mask_source, size=64).repeat(1, channels, 1, 1)  # (3, c, h, w)
+        fm_source = fm_source.repeat(3, 1, 1, 1)  # (3, c, h, w)
+        # 计算 Attention 时 we only consider the pixels belonging to same facial region.
+        fm_source = fm_source * mask_source_re  # (3, c, h, w) 3 stands for 3 parts
+
+        mask_ref_re = F.interpolate(mask_ref, size=64).repeat(1, channels, 1, 1)
+        fm_reference = fm_reference.repeat(3, 1, 1, 1)
+        fm_reference = fm_reference * mask_ref_re
+
+        theta_input = torch.cat((fm_source * 0.01, rel_pos_source), dim=1)
+        phi_input = torch.cat((fm_reference * 0.01, rel_pos_ref), dim=1)
+
+        theta_target = theta_input.view(batch_size, -1, HW)  # (N, C+136, H*W)
+        theta_target = theta_target.permute(0, 2, 1)  # (N, H*W, C+136)
+
+        phi_source = phi_input.view(batch_size, -1, HW)  # (N, C+136, H*W)
+
+        weight = torch.bmm(theta_target, phi_source)  # (3, HW, HW)
+        weight_ind = torch.LongTensor(weight.numpy().nonzero())
+        weight *= 200  # hyper parameters for visual feature
+        weight = F.softmax(weight, dim=-1)
+        weight = weight[weight_ind[0], weight_ind[1], weight_ind[2]]
+        # 那最后为什么不合成一个1*HW*HW的weight啊？
+        return torch.sparse.FloatTensor(weight_ind, weight, torch.Size([3, HW, HW]))
+
+    @staticmethod
+    def atten_feature(mask_ref, attention_map, old_gamma_matrix, old_beta_matrix):
+        # 论文中有说gamma和beta的想法源于style transfer，但不是general style transfer，所以这里要用mask计算每个facial region的style
+        batch_size, channels, width, height = old_gamma_matrix.size()
+        # channels = gamma_ref.shape[1]
+
+        mask_ref_re = F.interpolate(mask_ref, size=old_gamma_matrix.shape[2:]).repeat(1, channels, 1, 1)
+        gamma_ref_re = old_gamma_matrix.repeat(3, 1, 1, 1)
+        old_gamma_matrix = gamma_ref_re * mask_ref_re  # (3, c, h, w)
+        beta_ref_re = old_beta_matrix.repeat(3, 1, 1, 1)
+        old_beta_matrix = beta_ref_re * mask_ref_re
+
+        old_gamma_matrix = old_gamma_matrix.view(batch_size, -1, width * height)
+        old_beta_matrix = old_beta_matrix.view(batch_size, -1, width * height)
+
+        old_gamma_matrix = old_gamma_matrix.permute(0, 2, 1)
+        old_beta_matrix = old_beta_matrix.permute(0, 2, 1)
+        new_gamma_matrix = torch.bmm(attention_map.to_dense(), old_gamma_matrix)
+        new_beta_matrix = torch.bmm(attention_map.to_dense(), old_beta_matrix)
+        gamma = new_gamma_matrix.view(batch_size, 1, width, height)  # (3, c, h, w)
+        beta = new_beta_matrix.view(batch_size, 1, width, height)
+
+        # gamma = atten_module_g(gamma_ref, attention_map)  # (3, c, h, w)
+        # beta = atten_module_b(beta_ref, attention_map)
+
+        gamma = (gamma[0] + gamma[1] + gamma[2]).unsqueeze(0)  # (c, h, w) combine the three parts
+        beta = (beta[0] + beta[1] + beta[2]).unsqueeze(0)
+        return gamma, beta
+
+    def forward(self, fm_source, fm_reference, mask_source, mask_ref, rel_pos_source, rel_pos_ref):
+        # batch_size, channels, width, height = fm_reference.size()
+
+        old_gamma_matrix = self.lambda_matrix_conv(fm_reference)
+        old_beta_matrix = self.beta_matrix_conv(fm_reference)
+
+        attention_map = self.get_attention_map(mask_source, mask_ref, fm_source, fm_reference, rel_pos_source, rel_pos_ref)
+        gamma, beta = self.atten_feature(mask_ref, attention_map, old_gamma_matrix, old_beta_matrix)
 
         # 对feature_map_source进行修改
-        lambda_tensor = new_lambda_matrix.expand(batch_size, 256, width, height)
-        beta_tensor = new_beta_matrix.expand(batch_size, 256, width, height)
-        morphed_fm_source = torch.mul(lambda_tensor, fm_source)
-        morphed_fm_source = torch.add(morphed_fm_source, beta_tensor)
+        morphed_fm_source = fm_source * (1 + gamma) + beta
+
+        # gamma_tensor = gamma.expand(batch_size, 256, width, height)
+        # beta_tensor = beta.expand(batch_size, 256, width, height)
+        # morphed_fm_source = torch.mul(gamma_tensor, fm_source)
+        # morphed_fm_source = torch.add(morphed_fm_source, beta_tensor)
 
         return morphed_fm_source
