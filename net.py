@@ -110,8 +110,7 @@ class VGG(nn.Module):
             self.pool5 = nn.AvgPool2d(kernel_size=2, stride=2)
 
     def forward(self, x, out_keys):
-        out = {}
-        out['r11'] = F.relu(self.conv1_1(x))
+        out = {'r11': F.relu(self.conv1_1(x))}
         out['r12'] = F.relu(self.conv1_2(out['r11']))
         out['p1'] = self.pool1(out['r12'])
         out['r21'] = F.relu(self.conv2_1(out['p1']))
@@ -179,7 +178,7 @@ class Generator(nn.Module):
         self.MDNet = MDNet()
         self.AMM = AMM()
 
-    def forward(self, source_image, reference_image, mask_source, mask_ref, rel_pos_source, rel_pos_ref):
+    def forward(self, source_image, mask_source, rel_pos_source, reference_image, mask_ref, rel_pos_ref):
         fm_source = self.encoder(source_image)
         fm_reference = self.MDNet(reference_image)
         morphed_fm = self.AMM(fm_source, fm_reference, mask_source, mask_ref, rel_pos_source, rel_pos_ref)
@@ -252,7 +251,10 @@ class AMM(nn.Module):
         phi_source = phi_input.view(batch_size, -1, HW)  # (N, C+136, H*W)
 
         weight = torch.bmm(theta_target, phi_source)  # (3, HW, HW)
-        weight_ind = torch.LongTensor(weight.numpy().nonzero())
+        weight = weight.cpu()
+        weight_ind = torch.LongTensor(weight.detach().numpy().nonzero())
+        weight = weight.cuda()
+        weight_ind = weight_ind.cuda()
         weight *= 200  # hyper parameters for visual feature
         weight = F.softmax(weight, dim=-1)
         weight = weight[weight_ind[0], weight_ind[1], weight_ind[2]]
@@ -268,21 +270,22 @@ class AMM(nn.Module):
         mask_ref_re = F.interpolate(mask_ref, size=old_gamma_matrix.shape[2:]).repeat(1, channels, 1, 1)
         gamma_ref_re = old_gamma_matrix.repeat(3, 1, 1, 1)
         old_gamma_matrix = gamma_ref_re * mask_ref_re  # (3, c, h, w)
+        print('old_gamma_matrix shape1: ', old_gamma_matrix.shape)
         beta_ref_re = old_beta_matrix.repeat(3, 1, 1, 1)
         old_beta_matrix = beta_ref_re * mask_ref_re
 
-        old_gamma_matrix = old_gamma_matrix.view(batch_size, -1, width * height)
-        old_beta_matrix = old_beta_matrix.view(batch_size, -1, width * height)
+        old_gamma_matrix = old_gamma_matrix.view(3, 1, -1)
+        print('old_gamma_matrix shape2: ', old_gamma_matrix.shape)
+        old_beta_matrix = old_beta_matrix.view(3, 1, -1)
 
         old_gamma_matrix = old_gamma_matrix.permute(0, 2, 1)
         old_beta_matrix = old_beta_matrix.permute(0, 2, 1)
+        print('old_gamma_matrix shape3: ', old_gamma_matrix.shape)
+        print('attention_map.to_dense() shape: ', attention_map.to_dense().shape)
         new_gamma_matrix = torch.bmm(attention_map.to_dense(), old_gamma_matrix)
         new_beta_matrix = torch.bmm(attention_map.to_dense(), old_beta_matrix)
-        gamma = new_gamma_matrix.view(batch_size, 1, width, height)  # (3, c, h, w)
-        beta = new_beta_matrix.view(batch_size, 1, width, height)
-
-        # gamma = atten_module_g(gamma_ref, attention_map)  # (3, c, h, w)
-        # beta = atten_module_b(beta_ref, attention_map)
+        gamma = new_gamma_matrix.view(-1, 1, width, height)  # (3, c, h, w)
+        beta = new_beta_matrix.view(-1, 1, width, height)
 
         gamma = (gamma[0] + gamma[1] + gamma[2]).unsqueeze(0)  # (c, h, w) combine the three parts
         beta = (beta[0] + beta[1] + beta[2]).unsqueeze(0)
@@ -294,15 +297,11 @@ class AMM(nn.Module):
         old_gamma_matrix = self.lambda_matrix_conv(fm_reference)
         old_beta_matrix = self.beta_matrix_conv(fm_reference)
 
-        attention_map = self.get_attention_map(mask_source, mask_ref, fm_source, fm_reference, rel_pos_source, rel_pos_ref)
+        attention_map = self.get_attention_map(mask_source, mask_ref, fm_source, fm_reference, rel_pos_source,
+                                               rel_pos_ref)
         gamma, beta = self.atten_feature(mask_ref, attention_map, old_gamma_matrix, old_beta_matrix)
 
         # 对feature_map_source进行修改
         morphed_fm_source = fm_source * (1 + gamma) + beta
-
-        # gamma_tensor = gamma.expand(batch_size, 256, width, height)
-        # beta_tensor = beta.expand(batch_size, 256, width, height)
-        # morphed_fm_source = torch.mul(gamma_tensor, fm_source)
-        # morphed_fm_source = torch.add(morphed_fm_source, beta_tensor)
 
         return morphed_fm_source
