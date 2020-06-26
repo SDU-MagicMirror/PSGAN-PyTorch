@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Generate Makeup</title>
+</head>
+<body>
+<div>
+    <form method="post" action="http://localhost:5000/generate_makeup" enctype="multipart/form-data">
+        <input type="file" size="30" name="user_image"/>
+        <br>
+        <input type="file" size="30" name="example_image"/>
+        <br>
+        <input type="text" class="txt_input" name="shade_alpha" style="margin-top:15px;"/>
+        <input type="text" class="txt_input" name="local_flag" style="margin-top:15px;"/>
+        <input type="text" class="txt_input" name="lip_flag" style="margin-top:15px;"/>
+        <input type="text" class="txt_input" name="eye_flag" style="margin-top:15px;"/>
+        <input type="text" class="txt_input" name="face_flag" style="margin-top:15px;"/>
+        <input type="submit" value="提交信息" class="button-new" style="margin-top:15px;"/>
+    </form>
+</div>
+</body>
+</html>
