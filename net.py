@@ -1,3 +1,6 @@
+#!/usr/bin/python
+# -*- encoding: utf-8 -*-
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,25 +12,6 @@ from ops.spectral_norm import spectral_norm as SpectralNorm
 # When LSGAN is used, it is basically same as MSELoss,
 # but it abstracts away the need to create the target label tensor
 # that has the same size as the input
-
-class ResidualBlock(nn.Module):
-    """Residual Block."""
-
-    def __init__(self, dim_in, dim_out, net_mode=None):
-        super(ResidualBlock, self).__init__()
-        if net_mode == 'MDNet' or (net_mode is None):
-            use_affine = True
-        elif net_mode == 'MANet':
-            use_affine = False
-        self.main = nn.Sequential(
-            nn.Conv2d(dim_in, dim_out, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.InstanceNorm2d(dim_out, affine=use_affine),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(dim_out, dim_out, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.InstanceNorm2d(dim_out, affine=use_affine))
-
-    def forward(self, x):
-        return x + self.main(x)
 
 
 class Discriminator(nn.Module):
@@ -136,114 +120,172 @@ class VGG(nn.Module):
         return [out[key] for key in out_keys]
 
 
-# Makeup Apply Network(MANet)
+class ResidualBlock(nn.Module):
+    """Residual Block."""
+
+    def __init__(self, dim_in, dim_out, net_mode=None):
+        if net_mode == 'p' or (net_mode is None):
+            use_affine = True
+        elif net_mode == 't':
+            use_affine = False
+        super(ResidualBlock, self).__init__()
+        self.main = nn.Sequential(
+            nn.Conv2d(dim_in, dim_out, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.InstanceNorm2d(dim_out, affine=use_affine),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim_out, dim_out, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.InstanceNorm2d(dim_out, affine=use_affine)
+        )
+
+    def forward(self, x):
+        return x + self.main(x)
+
+
+class GetMatrix(nn.Module):
+    def __init__(self, dim_in, dim_out):
+        super(GetMatrix, self).__init__()
+        self.get_gamma = nn.Conv2d(dim_in, dim_out, kernel_size=1, stride=1, padding=0, bias=False)
+        self.get_beta = nn.Conv2d(dim_in, dim_out, kernel_size=1, stride=1, padding=0, bias=False)
+
+    def forward(self, x):
+        gamma = self.get_gamma(x)
+        beta = self.get_beta(x)
+        return x, gamma, beta
+
+
+class NONLocalBlock2D(nn.Module):
+    def __init__(self):
+        super(NONLocalBlock2D, self).__init__()
+        self.g = nn.Conv2d(in_channels=1, out_channels=1,
+                           kernel_size=1, stride=1, padding=0)
+
+    def forward(self, source, weight):
+        """(b, c, h, w)
+        src_diff: (3, 136, 32, 32)
+        """
+        batch_size = source.size(0)
+        g_source = source.view(batch_size, 1, -1)  # (N, C, H*W)
+        g_source = g_source.permute(0, 2, 1)  # (N, H*W, C)
+
+        y = torch.bmm(weight.to_dense(), g_source)
+        y = y.permute(0, 2, 1).contiguous()  # (N, C, H*W)
+        y = y.view(batch_size, 1, *source.size()[2:])
+        return y
+
+
 class Generator(nn.Module):
     """Generator. Encoder-Decoder Architecture."""
 
-    def __init__(self, conv_dim=64):
+    def __init__(self):
         super(Generator, self).__init__()
 
-        encoder_layers = [nn.Conv2d(3, conv_dim, kernel_size=7, stride=1, padding=3, bias=False),
-                          nn.InstanceNorm2d(conv_dim, affine=False), nn.ReLU(inplace=True)]
+        # -------------------------- PNet(MDNet) for obtaining makeup matrices --------------------------
+
+        layers = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=7, stride=1, padding=3, bias=False),
+            nn.InstanceNorm2d(64, affine=True),
+            nn.ReLU(inplace=True)
+        )
+        self.pnet_in = layers
 
         # Down-Sampling
-        curr_dim = conv_dim
+        curr_dim = 64
         for i in range(2):
-            encoder_layers.append(nn.Conv2d(curr_dim, curr_dim * 2, kernel_size=4, stride=2, padding=1, bias=False))
-            encoder_layers.append(nn.InstanceNorm2d(curr_dim * 2, affine=False))
-            encoder_layers.append(nn.ReLU(inplace=True))
+            layers = nn.Sequential(
+                nn.Conv2d(curr_dim, curr_dim * 2, kernel_size=4, stride=2, padding=1, bias=False),
+                nn.InstanceNorm2d(curr_dim * 2, affine=True),
+                nn.ReLU(inplace=True),
+            )
+            setattr(self, f'pnet_down_{i + 1}', layers)
+            curr_dim = curr_dim * 2
+
+        # Bottleneck. All bottlenecks share the same attention module
+        self.atten_bottleneck_g = NONLocalBlock2D()
+        self.atten_bottleneck_b = NONLocalBlock2D()
+        self.simple_spade = GetMatrix(curr_dim, 1)  # get the makeup matrix
+
+        for i in range(3):
+            setattr(self, f'pnet_bottleneck_{i + 1}', ResidualBlock(dim_in=curr_dim, dim_out=curr_dim, net_mode='p'))
+
+        # --------------------------- TNet(MANet) for applying makeup transfer ----------------------------
+
+        self.tnet_in_conv = nn.Conv2d(3, 64, kernel_size=7, stride=1, padding=3, bias=False)
+        self.tnet_in_spade = nn.InstanceNorm2d(64, affine=False)
+        self.tnet_in_relu = nn.ReLU(inplace=True)
+
+        # Down-Sampling
+        curr_dim = 64
+        for i in range(2):
+            setattr(self, f'tnet_down_conv_{i + 1}',
+                    nn.Conv2d(curr_dim, curr_dim * 2, kernel_size=4, stride=2, padding=1, bias=False))
+            setattr(self, f'tnet_down_spade_{i + 1}', nn.InstanceNorm2d(curr_dim * 2, affine=False))
+            setattr(self, f'tnet_down_relu_{i + 1}', nn.ReLU(inplace=True))
             curr_dim = curr_dim * 2
 
         # Bottleneck
-        for i in range(3):
-            encoder_layers.append(ResidualBlock(dim_in=curr_dim, dim_out=curr_dim, net_mode='MANet'))
-
-        decoder_layers = []
-        for i in range(3):
-            decoder_layers.append(ResidualBlock(dim_in=curr_dim, dim_out=curr_dim, net_mode='MANet'))
+        for i in range(6):
+            setattr(self, f'tnet_bottleneck_{i + 1}', ResidualBlock(dim_in=curr_dim, dim_out=curr_dim, net_mode='t'))
 
         # Up-Sampling
         for i in range(2):
-            decoder_layers.append(
-                nn.ConvTranspose2d(curr_dim, curr_dim // 2, kernel_size=4, stride=2, padding=1, bias=False))
-            decoder_layers.append(nn.InstanceNorm2d(curr_dim // 2, affine=True))
-            decoder_layers.append(nn.ReLU(inplace=True))
+            setattr(self, f'tnet_up_conv_{i + 1}',
+                    nn.ConvTranspose2d(curr_dim, curr_dim // 2, kernel_size=4, stride=2, padding=1, bias=False))
+            setattr(self, f'tnet_up_spade_{i + 1}', nn.InstanceNorm2d(curr_dim // 2, affine=False))
+            setattr(self, f'tnet_up_relu_{i + 1}', nn.ReLU(inplace=True))
             curr_dim = curr_dim // 2
 
-        decoder_layers.append(nn.Conv2d(curr_dim, 3, kernel_size=7, stride=1, padding=3, bias=False))
-        decoder_layers.append(nn.Tanh())
-
-        self.encoder = nn.Sequential(*encoder_layers)
-        self.decoder = nn.Sequential(*decoder_layers)
-        self.MDNet = MDNet()
-        self.AMM = AMM()
-
-    def forward(self, source_image, mask_source, rel_pos_source, reference_image, mask_ref, rel_pos_ref):
-        fm_source = self.encoder(source_image)
-        fm_reference = self.MDNet(reference_image)
-        morphed_fm = self.AMM(fm_source, fm_reference, mask_source, mask_ref, rel_pos_source, rel_pos_ref)
-        result = self.decoder(morphed_fm)
-        return result
-
-
-class MDNet(nn.Module):
-    """Generator. Encoder-Decoder Architecture."""
-
-    # MDNet is similar to the encoder of StarGAN
-    def __init__(self, conv_dim=64):
-        super(MDNet, self).__init__()
-
-        layers = [nn.Conv2d(3, conv_dim, kernel_size=7, stride=1, padding=3, bias=False),
-                  nn.InstanceNorm2d(conv_dim, affine=True), nn.ReLU(inplace=True)]
-
-        # Down-Sampling
-        curr_dim = conv_dim
-        for i in range(2):
-            layers.append(nn.Conv2d(curr_dim, curr_dim * 2, kernel_size=4, stride=2, padding=1, bias=False))
-            layers.append(nn.InstanceNorm2d(curr_dim * 2, affine=True))
-            layers.append(nn.ReLU(inplace=True))
-            curr_dim = curr_dim * 2
-
-        # Bottleneck
-        for i in range(3):
-            layers.append(ResidualBlock(dim_in=curr_dim, dim_out=curr_dim, net_mode='MDNet'))
-        self.main = nn.Sequential(*layers)
-
-    def forward(self, reference_image):
-        fm_reference = self.main(reference_image)
-        return fm_reference
-
-
-# AMM参考 PSGAN 官方代码进行了修改
-class AMM(nn.Module):
-    """Attentive Makeup Morphing module"""
-
-    def __init__(self):
-        super(AMM, self).__init__()
-        self.visual_feature_weight = 0.01
-        self.lambda_matrix_conv = nn.Conv2d(in_channels=256, out_channels=1, kernel_size=1)
-        self.beta_matrix_conv = nn.Conv2d(in_channels=256, out_channels=1, kernel_size=1)
-        self.softmax = nn.Softmax(dim=-1)
+        layers = nn.Sequential(
+            nn.Conv2d(curr_dim, 3, kernel_size=7, stride=1, padding=3, bias=False),
+            nn.Tanh()
+        )
+        self.tnet_out = layers
 
     @staticmethod
-    def get_attention_map(mask_source, mask_ref, fm_source, fm_reference, rel_pos_source, rel_pos_ref):
+    def atten_feature(mask_s, weight, gamma_s, beta_s, atten_module_g, atten_module_b):
+        """
+        feature size: (1, c, h, w)
+        mask_c(s): (3, 1, h, w)
+        diff_c: (1, 138, 256, 256)
+        return: (1, c, h, w)
+        """
+        channel_num = gamma_s.shape[1]
+
+        mask_s_re = F.interpolate(mask_s, size=gamma_s.shape[2:]).repeat(1, channel_num, 1, 1)
+        gamma_s_re = gamma_s.repeat(3, 1, 1, 1)
+        gamma_s = gamma_s_re * mask_s_re  # (3, c, h, w)
+        beta_s_re = beta_s.repeat(3, 1, 1, 1)
+        beta_s = beta_s_re * mask_s_re
+
+        gamma = atten_module_g(gamma_s, weight)  # (3, c, h, w)
+        beta = atten_module_b(beta_s, weight)
+
+        gamma = (gamma[0] + gamma[1] + gamma[2]).unsqueeze(0)  # (c, h, w) combine the three parts
+        beta = (beta[0] + beta[1] + beta[2]).unsqueeze(0)
+        return gamma, beta
+
+    @staticmethod
+    def get_weight(mask_c, mask_s, fea_c, fea_s, diff_c, diff_s, mode='train'):
+        """  s --> source; c --> target
+        feature size: (1, 256, 64, 64)
+        diff: (3, 136, 32, 32)
+        """
         HW = 64 * 64
         batch_size = 3
-
+        assert fea_s is not None  # fea_s when i==3
         # get 3 part fea using mask
-        channels = fm_reference.shape[1]
+        channel_num = fea_s.shape[1]
 
-        mask_source_re = F.interpolate(mask_source, size=64).repeat(1, channels, 1, 1)  # (3, c, h, w)
-        fm_source = fm_source.repeat(3, 1, 1, 1)  # (3, c, h, w)
-        # 计算 Attention 时 we only consider the pixels belonging to same facial region.
-        fm_source = fm_source * mask_source_re  # (3, c, h, w) 3 stands for 3 parts
+        mask_c_re = F.interpolate(mask_c, size=64).repeat(1, channel_num, 1, 1)  # (3, c, h, w)
+        fea_c = fea_c.repeat(3, 1, 1, 1)  # (3, c, h, w)
+        # 这里的mask难道是分开三个区域？为了论文中公式的同一个facial region
+        fea_c = fea_c * mask_c_re  # (3, c, h, w) 3 stands for 3 parts
 
-        mask_ref_re = F.interpolate(mask_ref, size=64).repeat(1, channels, 1, 1)
-        fm_reference = fm_reference.repeat(3, 1, 1, 1)
-        fm_reference = fm_reference * mask_ref_re
+        mask_s_re = F.interpolate(mask_s, size=64).repeat(1, channel_num, 1, 1)
+        fea_s = fea_s.repeat(3, 1, 1, 1)
+        fea_s = fea_s * mask_s_re
 
-        theta_input = torch.cat((fm_source * 0.01, rel_pos_source), dim=1)
-        phi_input = torch.cat((fm_reference * 0.01, rel_pos_ref), dim=1)
+        theta_input = torch.cat((fea_c * 0.01, diff_c), dim=1)
+        phi_input = torch.cat((fea_s * 0.01, diff_s), dim=1)
 
         theta_target = theta_input.view(batch_size, -1, HW)  # (N, C+136, H*W)
         theta_target = theta_target.permute(0, 2, 1)  # (N, H*W, C+136)
@@ -251,57 +293,76 @@ class AMM(nn.Module):
         phi_source = phi_input.view(batch_size, -1, HW)  # (N, C+136, H*W)
 
         weight = torch.bmm(theta_target, phi_source)  # (3, HW, HW)
-        weight = weight.cpu()
-        weight_ind = torch.LongTensor(weight.detach().numpy().nonzero())
-        weight = weight.cuda()
-        weight_ind = weight_ind.cuda()
+        if mode == 'train':
+            weight = weight.cpu()
+            weight_ind = torch.LongTensor(weight.detach().numpy().nonzero())
+            weight = weight.cuda()
+            weight_ind = weight_ind.cuda()
+        else:
+            weight_ind = torch.LongTensor(weight.numpy().nonzero())
         weight *= 200  # hyper parameters for visual feature
         weight = F.softmax(weight, dim=-1)
         weight = weight[weight_ind[0], weight_ind[1], weight_ind[2]]
-        # 那最后为什么不合成一个1*HW*HW的weight啊？
         return torch.sparse.FloatTensor(weight_ind, weight, torch.Size([3, HW, HW]))
 
-    @staticmethod
-    def atten_feature(mask_ref, attention_map, old_gamma_matrix, old_beta_matrix):
-        # 论文中有说gamma和beta的想法源于style transfer，但不是general style transfer，所以这里要用mask计算每个facial region的style
-        batch_size, channels, width, height = old_gamma_matrix.size()
-        # channels = gamma_ref.shape[1]
+    def forward_atten(self, c, s, mask_c, mask_s, diff_c, diff_s, gamma=None, beta=None, ret=False, mode='train'):
+        """attention version
+        c: content, stands for source image. shape: (b, c, h, w)
+        s: style, stands for reference image. shape: (b, c, h, w)
+        mask_list_c: lip, skin, eye. (b, 1, h, w)
+        """
 
-        mask_ref_re = F.interpolate(mask_ref, size=old_gamma_matrix.shape[2:]).repeat(1, channels, 1, 1)
-        gamma_ref_re = old_gamma_matrix.repeat(3, 1, 1, 1)
-        old_gamma_matrix = gamma_ref_re * mask_ref_re  # (3, c, h, w)
-        print('old_gamma_matrix shape1: ', old_gamma_matrix.shape)
-        beta_ref_re = old_beta_matrix.repeat(3, 1, 1, 1)
-        old_beta_matrix = beta_ref_re * mask_ref_re
+        # forward c in tnet(MANet)
+        c_tnet = self.tnet_in_conv(c)
+        s = self.pnet_in(s)
+        c_tnet = self.tnet_in_spade(c_tnet)
+        c_tnet = self.tnet_in_relu(c_tnet)
 
-        old_gamma_matrix = old_gamma_matrix.view(3, 1, -1)
-        print('old_gamma_matrix shape2: ', old_gamma_matrix.shape)
-        old_beta_matrix = old_beta_matrix.view(3, 1, -1)
+        # down-sampling
+        for i in range(2):
+            if gamma is None:
+                cur_pnet_down = getattr(self, f'pnet_down_{i + 1}')
+                s = cur_pnet_down(s)
 
-        old_gamma_matrix = old_gamma_matrix.permute(0, 2, 1)
-        old_beta_matrix = old_beta_matrix.permute(0, 2, 1)
-        print('old_gamma_matrix shape3: ', old_gamma_matrix.shape)
-        print('attention_map.to_dense() shape: ', attention_map.to_dense().shape)
-        new_gamma_matrix = torch.bmm(attention_map.to_dense(), old_gamma_matrix)
-        new_beta_matrix = torch.bmm(attention_map.to_dense(), old_beta_matrix)
-        gamma = new_gamma_matrix.view(-1, 1, width, height)  # (3, c, h, w)
-        beta = new_beta_matrix.view(-1, 1, width, height)
+            cur_tnet_down_conv = getattr(self, f'tnet_down_conv_{i + 1}')
+            cur_tnet_down_spade = getattr(self, f'tnet_down_spade_{i + 1}')
+            cur_tnet_down_relu = getattr(self, f'tnet_down_relu_{i + 1}')
+            c_tnet = cur_tnet_down_conv(c_tnet)
+            c_tnet = cur_tnet_down_spade(c_tnet)
+            c_tnet = cur_tnet_down_relu(c_tnet)
 
-        gamma = (gamma[0] + gamma[1] + gamma[2]).unsqueeze(0)  # (c, h, w) combine the three parts
-        beta = (beta[0] + beta[1] + beta[2]).unsqueeze(0)
-        return gamma, beta
+        # bottleneck
+        for i in range(6):
+            if gamma is None and i <= 2:
+                cur_pnet_bottleneck = getattr(self, f'pnet_bottleneck_{i + 1}')
+            cur_tnet_bottleneck = getattr(self, f'tnet_bottleneck_{i + 1}')
 
-    def forward(self, fm_source, fm_reference, mask_source, mask_ref, rel_pos_source, rel_pos_ref):
-        # batch_size, channels, width, height = fm_reference.size()
+            # get s_pnet from p and transform
+            if i == 3:
+                if gamma is None:  # not in test_mix
+                    s, gamma, beta = self.simple_spade(s)
+                    weight = self.get_weight(mask_c, mask_s, c_tnet, s, diff_c, diff_s, mode)
+                    gamma, beta = self.atten_feature(mask_s, weight, gamma, beta, self.atten_bottleneck_g,
+                                                     self.atten_bottleneck_b)
+                    if ret:
+                        return [gamma, beta]
+                # else:                       # in test mode
+                # gamma, beta = param_A[0]*w + param_B[0]*(1-w), param_A[1]*w + param_B[1]*(1-w)
 
-        old_gamma_matrix = self.lambda_matrix_conv(fm_reference)
-        old_beta_matrix = self.beta_matrix_conv(fm_reference)
+                c_tnet = c_tnet * (1 + gamma) + beta  # apply makeup transfer using makeup matrices
 
-        attention_map = self.get_attention_map(mask_source, mask_ref, fm_source, fm_reference, rel_pos_source,
-                                               rel_pos_ref)
-        gamma, beta = self.atten_feature(mask_ref, attention_map, old_gamma_matrix, old_beta_matrix)
+            if gamma is None and i <= 2:
+                s = cur_pnet_bottleneck(s)
+            c_tnet = cur_tnet_bottleneck(c_tnet)
 
-        # 对feature_map_source进行修改
-        morphed_fm_source = fm_source * (1 + gamma) + beta
+        # up-sampling
+        for i in range(2):
+            cur_tnet_up_conv = getattr(self, f'tnet_up_conv_{i + 1}')
+            cur_tnet_up_spade = getattr(self, f'tnet_up_spade_{i + 1}')
+            cur_tnet_up_relu = getattr(self, f'tnet_up_relu_{i + 1}')
+            c_tnet = cur_tnet_up_conv(c_tnet)
+            c_tnet = cur_tnet_up_spade(c_tnet)
+            c_tnet = cur_tnet_up_relu(c_tnet)
 
-        return morphed_fm_source
+        c_tnet = self.tnet_out(c_tnet)
+        return c_tnet

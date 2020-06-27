@@ -5,8 +5,6 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-from .makeup_utils import preprocess_image
-
 
 class MAKEUP(Dataset):
     def __init__(self, image_path, transform, mode, transform_mask, cls_list):
@@ -86,46 +84,21 @@ class MAKEUP(Dataset):
             index_A = random.randint(0, getattr(self, "num_of_train_" + self.cls_A + "_data") - 1)
             index_B = random.randint(0, getattr(self, "num_of_train_" + self.cls_B + "_data") - 1)
             # 这里image_path是通过./data+txt中的image_path得到的，所以txt中应该写的是./data的相对地址，比如/makeup/xxx
-            # image_A = Image.open(
-            #     os.path.join(self.image_path, getattr(self, "train_" + self.cls_A + "_filenames")[index_A])).convert(
-            #     "RGB")
-            # image_B = Image.open(
-            #     os.path.join(self.image_path, getattr(self, "train_" + self.cls_B + "_filenames")[index_B])).convert(
-            #     "RGB")
-            image_A = Image.open(
-                os.path.join(self.image_path, getattr(self, "train_" + self.cls_A + "_filenames")[index_A]))
-            image_B = Image.open(
-                os.path.join(self.image_path, getattr(self, "train_" + self.cls_B + "_filenames")[index_B]))
             mask_A = Image.open(
                 os.path.join(self.image_path, getattr(self, "train_" + self.cls_A + "_mask_filenames")[index_A]))
             mask_B = Image.open(
                 os.path.join(self.image_path, getattr(self, "train_" + self.cls_B + "_mask_filenames")[index_B]))
-            # return self.transform(image_A), self.transform(image_B), self.transform_mask(mask_A), self.transform_mask(
-            #     mask_B)
-            processed_img_A = preprocess_image(image_A)
-            processed_img_B = preprocess_image(image_B)
-            return processed_img_A, processed_img_B, self.transform_mask(mask_A), self.transform_mask(mask_B)
+            return os.path.join(self.image_path,
+                                getattr(self, "train_" + self.cls_A + "_filenames")[index_A]), os.path.join(
+                self.image_path, getattr(self, "train_" + self.cls_B + "_filenames")[index_B]), self.transform_mask(
+                mask_A), self.transform_mask(mask_B)
 
         if self.mode in ['test', 'test_all']:
-            image_A = Image.open(os.path.join(self.image_path, getattr(self, "test_" + self.cls_A + "_filenames")[
-                index // getattr(self, 'num_of_test_' + self.cls_list[1] + '_data')])).convert("RGB")
-            image_B = Image.open(os.path.join(self.image_path, getattr(self, "test_" + self.cls_B + "_filenames")[
-                index % getattr(self, 'num_of_test_' + self.cls_list[1] + '_data')])).convert("RGB")
-            return self.transform(image_A), self.transform(image_B)
-        if self.mode == "test_baseline":
-            image_A = Image.open(os.path.join(self.image_path, "baseline", "org_aligned",
-                                              getattr(self, "test_" + self.cls_A + "_filenames")[index // getattr(self,
-                                                                                                                  'num_of_test_' +
-                                                                                                                  self.cls_list[
-                                                                                                                      1] + '_data')])).convert(
-                "RGB")
-            image_B = Image.open(os.path.join(self.image_path, "baseline", "ref_aligned",
-                                              getattr(self, "test_" + self.cls_B + "_filenames")[index % getattr(self,
-                                                                                                                 'num_of_test_' +
-                                                                                                                 self.cls_list[
-                                                                                                                     1] + '_data')])).convert(
-                "RGB")
-            return self.transform(image_A), self.transform(image_B)
+            image_A = os.path.join(self.image_path, getattr(self, "test_" + self.cls_A + "_filenames")[
+                index // getattr(self, 'num_of_test_' + self.cls_list[1] + '_data')])
+            image_B = os.path.join(self.image_path, getattr(self, "test_" + self.cls_B + "_filenames")[
+                index % getattr(self, 'num_of_test_' + self.cls_list[1] + '_data')])
+            return image_A, image_B
 
     def __len__(self):
         # 这里应该是为了测试的时候实验同一张source对应不同reference的结果

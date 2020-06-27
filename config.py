@@ -7,6 +7,7 @@ default.vis_path = './visulization/'
 default.log_path = './log/'
 # default.data_path = './data/'
 default.data_path = '/home/zhiyong/RemoteServer/data/makeup_dataset'
+# default.data_path = '/home/mist/data/makeup_dataset'
 # default.data_path = 'F:/zzy/data/makeup_dataset'
 
 config = edict()
@@ -14,7 +15,7 @@ config = edict()
 # Hyper-parameters
 
 config.multi_gpu = False
-config.gpu_ids = [0,1,2]
+config.gpu_ids = [0, 1, 2]
 
 # Setting path
 config.snapshot_path = default.snapshot_path
@@ -38,7 +39,7 @@ config.log_step = 10
 config.vis_step = config.snapshot_step
 config.batch_size = 1
 config.lambda_A = 10.0
-config.lambda_B =10.0
+config.lambda_B = 10.0
 # config.lambda_idt = 0.5
 # 没看懂这个identity_loss哪来的，先关了
 config.lambda_idt = 0
@@ -52,7 +53,6 @@ config.checkpoint = ""
 
 config.test_model = "51_2000"
 
-
 # Setting datasets
 dataset_config = edict()
 
@@ -60,12 +60,14 @@ dataset_config.name = 'MAKEUP'
 dataset_config.dataset_path = default.data_path
 dataset_config.img_size = 256
 
+
 def generate_config(_network, _dataset):
     for k, v in dataset_config[_dataset].items():
         if k in config:
             config[k] = v
         elif k in default:
             default[k] = v
+
 
 # 用来合并config和args的参数
 def merge_cfg_arg(config, args):
@@ -102,4 +104,3 @@ def merge_cfg_arg(config, args):
     if "test_model" in config.items():
         config.test_model = args.test_model
     return config
-

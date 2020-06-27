@@ -1,10 +1,10 @@
 import datetime
 import os
+import os.path as osp
 import time
 
 import torch.nn.init as init
 import torchvision.models as models
-from torchvision.transforms import ToPILImage
 from torchvision.utils import save_image
 
 import net
@@ -12,6 +12,8 @@ import tools.plot as plot_fig
 from data_loaders.makeup_utils import *
 from ops.histogram_matching import *
 from ops.loss_added import GANLoss
+
+pwd = osp.split(osp.realpath(__file__))[0]
 
 
 class Solver_PSGAN(object):
@@ -40,7 +42,6 @@ class Solver_PSGAN(object):
         self.img_size = config.img_size
         self.g_conv_dim = config.g_conv_dim
         self.d_conv_dim = config.d_conv_dim
-        self.g_repeat_num = config.g_repeat_num
         self.d_repeat_num = config.d_repeat_num
         self.lips = config.lips
         self.skin = config.skin
@@ -163,7 +164,7 @@ class Solver_PSGAN(object):
 
     def build_model(self):
         # Define generators and discriminators
-        self.G = net.Generator(self.g_conv_dim)
+        self.G = net.Generator()
         for i in self.cls:
             setattr(self, "D_" + i, net.Discriminator(self.img_size, self.d_conv_dim, self.d_repeat_num, self.norm))
 
@@ -172,6 +173,7 @@ class Solver_PSGAN(object):
         self.criterionGAN = GANLoss(use_lsgan=True, tensor=torch.cuda.FloatTensor)
         self.vgg = models.vgg16(pretrained=True)
         # Optimizers
+        self.g_optimizer = torch.optim.Adam(self.G.parameters(), self.g_lr, [self.beta1, self.beta2])
         for i in self.cls:
             setattr(self, "d_" + i + "_optimizer",
                     torch.optim.Adam(filter(lambda p: p.requires_grad, getattr(self, "D_" + i).parameters()), \
@@ -242,12 +244,6 @@ class Solver_PSGAN(object):
         loss = self.criterionL1(input_masked, input_match)
         return loss
 
-    def generate(self, org_A, ref_B, lms_A=None, lms_B=None, mask_A=None, mask_B=None,
-                 diff_A=None, diff_B=None, gamma=None, beta=None, ret=False):
-        """org_A is content, ref_B is style"""
-        res = self.G.forward_atten(org_A, ref_B, mask_A, mask_B, diff_A, diff_B, gamma, beta, ret)
-        return res
-
     def train(self):
         # Start with trained model if exists
         cls_A = self.cls[0]
@@ -262,7 +258,8 @@ class Solver_PSGAN(object):
         # Start training
         self.start_time = time.time()
         for self.e in range(start, self.num_epochs):
-            for self.i, (processed_img_A, processed_img_B, mask_A, mask_B) in enumerate(self.data_loader_train):
+            current_iter = 0
+            for self.i, (img_A, img_B, mask_A, mask_B) in enumerate(self.data_loader_train):
                 # Convert tensor to variable
                 # mask attribute: 0:background 1:face 2:left-eyebrown 3:right-eyebrown 4:left-eye 5: right-eye 6: nose
                 # 7: upper-lip 8: teeth 9: under-lip 10:hair 11: left-ear 12: right-ear 13: neck
@@ -295,9 +292,19 @@ class Solver_PSGAN(object):
                             self.mask_preprocess(mask_A_eye_left, mask_B_eye_left)
                         mask_A_eye_right, mask_B_eye_right, index_A_eye_right, index_B_eye_right = \
                             self.mask_preprocess(mask_A_eye_right, mask_B_eye_right)
-
-                processed_org_A = [self.to_var(item.squeeze(0), requires_grad=False) for item in processed_img_A]
-                processed_ref_B = [self.to_var(item.squeeze(0), requires_grad=False) for item in processed_img_B]
+                try:
+                    processed_img_A = Image.open(img_A[0])
+                    processed_img_B = Image.open(img_B[0])
+                    processed_img_A = preprocess_image(processed_img_A)
+                    processed_img_B = preprocess_image(processed_img_B)
+                    processed_org_A = [self.to_var(item, requires_grad=False) for item in processed_img_A]
+                    processed_ref_B = [self.to_var(item, requires_grad=False) for item in processed_img_B]
+                except Exception as e:
+                    print(str(e))
+                    print('current iteration is: ', current_iter)
+                    print('image_A is: ', img_A[0])
+                    print('image_B is: ', img_B[0])
+                    continue
 
                 org_A = processed_org_A[0]
                 ref_B = processed_ref_B[0]
@@ -308,13 +315,12 @@ class Solver_PSGAN(object):
                 out = getattr(self, "D_" + cls_A)(ref_B)
                 d_loss_real = self.criterionGAN(out, True)
                 # Fake
-                # 因为PSGAN论文中是一次只生成一个图片，所以这里没有采用BeautyGAN中2个branch
-                fake_A = self.generate(processed_org_A[0], processed_ref_B[0], None, None, processed_org_A[1],
-                                       processed_ref_B[1],
-                                       processed_org_A[2], processed_ref_B[2])
-                fake_B = self.generate(processed_ref_B[0], processed_org_A[0], None, None, processed_ref_B[1],
-                                       processed_org_A[1],
-                                       processed_ref_B[2], processed_org_A[2])
+                fake_A = Solver_PSGAN.generate(processed_org_A[0], processed_ref_B[0], None, None, processed_org_A[1],
+                                               processed_ref_B[1], processed_org_A[2], processed_ref_B[2],
+                                               generator=self.G)
+                fake_B = Solver_PSGAN.generate(processed_ref_B[0], processed_org_A[0], None, None, processed_ref_B[1],
+                                               processed_org_A[1], processed_ref_B[2], processed_org_A[2],
+                                               generator=self.G)
                 fake_A = Variable(fake_A.data).detach()
                 fake_B = Variable(fake_B.data).detach()
                 out = getattr(self, "D_" + cls_A)(fake_A)
@@ -349,7 +355,6 @@ class Solver_PSGAN(object):
                 # ================== Train G ================== #
                 if (self.i + 1) % self.ndis == 0:
                     # adversarial loss, i.e. L_trans,v in the paper
-
                     # identity loss
                     # 论文里没有这个identity loss啊？
                     if self.lambda_idt > 0:
@@ -372,41 +377,37 @@ class Solver_PSGAN(object):
 
                     # GAN loss D_A(G_A(A))
                     # fake_A in class B,
-                    fake_A = self.generate(processed_org_A[0], processed_ref_B[0], None, None, processed_org_A[1],
-                                           processed_ref_B[1],
-                                           processed_org_A[2], processed_ref_B[2])
-                    # print('fake_A shape: ', fake_A.shape)
-                    fake_A_img = fake_A.cpu().clone().squeeze(0)
-                    # normalize
-                    min_, max_ = fake_A_img.min(), fake_A_img.max()
-                    fake_A_img.add_(-min_).div_(max_ - min_ + 1e-5)
-                    fake_A_img = ToPILImage()(fake_A_img)
+                    fake_A = Solver_PSGAN.generate(processed_org_A[0], processed_ref_B[0], None, None,
+                                                   processed_org_A[1],
+                                                   processed_ref_B[1],
+                                                   processed_org_A[2], processed_ref_B[2], generator=self.G)
+                    fake_A_img = data2img(fake_A)
 
-                    fake_B = self.generate(processed_ref_B[0], processed_org_A[0], None, None, processed_ref_B[1],
-                                           processed_org_A[1],
-                                           processed_ref_B[2], processed_org_A[2])
-                    fake_B_img = fake_B.cpu().clone().squeeze(0)
-                    # normalize
-                    min_, max_ = fake_B_img.min(), fake_B_img.max()
-                    fake_B_img.add_(-min_).div_(max_ - min_ + 1e-5)
-                    fake_B_img = ToPILImage()(fake_B_img)
+                    fake_B = Solver_PSGAN.generate(processed_ref_B[0], processed_org_A[0], None, None,
+                                                   processed_ref_B[1],
+                                                   processed_org_A[1],
+                                                   processed_ref_B[2], processed_org_A[2], generator=self.G)
+                    fake_B_img = data2img(fake_B)
 
                     pred_fake = getattr(self, "D_" + cls_A)(fake_A)
                     g_A_loss_adv = self.criterionGAN(pred_fake, True)
                     # GAN loss D_B(G_B(B))
                     pred_fake = getattr(self, "D_" + cls_B)(fake_B)
                     g_B_loss_adv = self.criterionGAN(pred_fake, True)
-                    processed_fake_A = preprocess_train_image(fake_A_img, processed_ref_B[1], processed_ref_B[2])
+
+                    processed_fake_A = preprocess_train_image(fake_A_img, processed_org_A[1], processed_org_A[2])
                     processed_fake_A = [self.to_var(item, requires_grad=False) for item in processed_fake_A]
-                    processed_fake_B = preprocess_train_image(fake_B_img, processed_org_A[1], processed_org_A[2])
+                    processed_fake_B = preprocess_train_image(fake_B_img, processed_ref_B[1], processed_ref_B[2])
                     processed_fake_B = [self.to_var(item, requires_grad=False) for item in processed_fake_B]
 
-                    rec_A = self.generate(processed_fake_A[0], processed_org_A[0], None, None, processed_fake_A[1],
-                                          processed_org_A[1],
-                                          processed_fake_A[2], processed_org_A[2])
-                    rec_B = self.generate(processed_fake_B[0], processed_ref_B[0], None, None, processed_fake_B[1],
-                                          processed_ref_B[1],
-                                          processed_fake_B[2], processed_ref_B[2])
+                    rec_A = Solver_PSGAN.generate(processed_fake_A[0], processed_org_A[0], None, None,
+                                                  processed_fake_A[1],
+                                                  processed_org_A[1],
+                                                  processed_fake_A[2], processed_org_A[2], generator=self.G)
+                    rec_B = Solver_PSGAN.generate(processed_fake_B[0], processed_ref_B[0], None, None,
+                                                  processed_fake_B[1],
+                                                  processed_ref_B[1],
+                                                  processed_fake_B[2], processed_ref_B[2], generator=self.G)
 
                     # color_histogram loss
                     # 这里作者的实现是不是有点问题啊，论文里的loss是计算的G(x,y)和HM(x,y)的，
@@ -483,7 +484,7 @@ class Solver_PSGAN(object):
                         self.loss['G-B-loss-his'] = g_B_loss_his.item()
 
                 # Print out log info
-                if (self.i + 1) % self.log_step == 0:
+                if (current_iter + 1) % self.log_step == 0:
                     self.log_terminal()
 
                 # plot the figures
@@ -491,17 +492,19 @@ class Solver_PSGAN(object):
                     plot_fig.plot(key_now, self.loss[key_now])
 
                 # save the images
-                if (self.i + 1) % self.vis_step == 0:
+                if (current_iter + 1) % self.vis_step == 0:
                     print("Saving middle output...")
                     self.vis_train([org_A, ref_B, fake_A, fake_B, rec_A, rec_B])
 
                 # Save model checkpoints
-                if (self.i + 1) % self.snapshot_step == 0:
+                if (current_iter + 1) % self.snapshot_step == 0:
                     self.save_models()
-                if self.i % 100 == 99:
+                if current_iter % 100 == 99:
                     plot_fig.flush(self.task_name)
 
                 plot_fig.tick()
+
+                current_iter += 1
 
             # Decay learning rate
             if (self.e + 1) > (self.num_epochs - self.num_epochs_decay):
@@ -528,18 +531,50 @@ class Solver_PSGAN(object):
         # saving test results
         mode = "test_vis"
         for i, (img_A, img_B) in enumerate(self.data_loader_test):
-            real_org = self.to_var(img_A)
-            real_ref = self.to_var(img_B)
+            if i == 20:
+                print('vis_test 20 images finish')
+                break
+            try:
+                processed_img_A = Image.open(img_A[0])
+                processed_img_B = Image.open(img_B[0])
+                processed_img_A = preprocess_image(processed_img_A)
+                processed_img_B = preprocess_image(processed_img_B)
+                processed_org_A = [self.to_var(item, requires_grad=False) for item in processed_img_A]
+                processed_ref_B = [self.to_var(item, requires_grad=False) for item in processed_img_B]
+            except Exception as e:
+                print(str(e))
+                print('vis_test image_A is: ', img_A[0])
+                print('vis_test image_B is: ', img_B[0])
+                continue
+
+            real_org = processed_org_A[0]
+            real_ref = processed_ref_B[0]
 
             image_list = [real_org, real_ref]
 
             # Get makeup result
-            # fake_A, fake_B = self.G(real_org, real_ref)
-            fake_A = self.G(real_org, real_ref)
-            fake_B = self.G(real_ref, real_org)
-            # rec_B, rec_A = self.G(fake_B, fake_A)
-            rec_B = self.G(fake_B, fake_A)
-            rec_A = self.G(fake_A, fake_B)
+            fake_A = Solver_PSGAN.generate(processed_org_A[0], processed_ref_B[0], None, None, processed_org_A[1],
+                                           processed_ref_B[1],
+                                           processed_org_A[2], processed_ref_B[2], generator=self.G)
+            fake_B = Solver_PSGAN.generate(processed_ref_B[0], processed_org_A[0], None, None, processed_ref_B[1],
+                                           processed_org_A[1],
+                                           processed_ref_B[2], processed_org_A[2], generator=self.G)
+
+            fake_A_img = data2img(fake_A)
+
+            fake_B_img = data2img(fake_B)
+
+            processed_fake_A = preprocess_train_image(fake_A_img, processed_ref_B[1], processed_ref_B[2])
+            processed_fake_A = [self.to_var(item, requires_grad=False) for item in processed_fake_A]
+            processed_fake_B = preprocess_train_image(fake_B_img, processed_org_A[1], processed_org_A[2])
+            processed_fake_B = [self.to_var(item, requires_grad=False) for item in processed_fake_B]
+
+            rec_A = Solver_PSGAN.generate(processed_fake_A[0], processed_org_A[0], None, None, processed_fake_A[1],
+                                          processed_org_A[1],
+                                          processed_fake_A[2], processed_org_A[2], generator=self.G)
+            rec_B = Solver_PSGAN.generate(processed_fake_B[0], processed_ref_B[0], None, None, processed_fake_B[1],
+                                          processed_ref_B[1],
+                                          processed_fake_B[2], processed_ref_B[2], generator=self.G)
 
             image_list.append(fake_A)
             image_list.append(fake_B)
@@ -553,7 +588,6 @@ class Solver_PSGAN(object):
                 os.makedirs(result_path_now)
             save_path = os.path.join(result_path_now, '{}_{}_{}_fake.png'.format(self.e, self.i, i + 1))
             save_image(self.de_norm(image_list.data), save_path, normalize=True)
-            # print('Translated test images and saved into "{}"..!'.format(save_path))
 
     def test(self):
         # Load trained parameters
@@ -563,8 +597,21 @@ class Solver_PSGAN(object):
         time_total = 0
         for i, (img_A, img_B) in enumerate(self.data_loader_test):
             start = time.time()
-            real_org = self.to_var(img_A)
-            real_ref = self.to_var(img_B)
+            try:
+                processed_img_A = Image.open(img_A[0])
+                processed_img_B = Image.open(img_B[0])
+                processed_img_A = preprocess_image(processed_img_A)
+                processed_img_B = preprocess_image(processed_img_B)
+                processed_org_A = [self.to_var(item, requires_grad=False) for item in processed_img_A]
+                processed_ref_B = [self.to_var(item, requires_grad=False) for item in processed_img_B]
+            except Exception as e:
+                print(str(e))
+                print('vis_test image_A is: ', img_A[0])
+                print('vis_test image_B is: ', img_B[0])
+                continue
+
+            real_org = processed_org_A[0]
+            real_ref = processed_ref_B[0]
 
             image_list = []
             image_list_0 = []
@@ -572,12 +619,28 @@ class Solver_PSGAN(object):
             image_list.append(real_ref)
 
             # Get makeup result
-            # fake_A, fake_B = self.G(real_org, real_ref)
-            fake_A = self.G(real_org, real_ref)
-            fake_B = self.G(real_ref, real_org)
-            # rec_B, rec_A = self.G(fake_B, fake_A)
-            rec_B = self.G(fake_B, fake_A)
-            rec_A = self.G(fake_A, fake_B)
+            fake_A = Solver_PSGAN.generate(processed_org_A[0], processed_ref_B[0], None, None, processed_org_A[1],
+                                           processed_ref_B[1],
+                                           processed_org_A[2], processed_ref_B[2], generator=self.G)
+            fake_B = Solver_PSGAN.generate(processed_ref_B[0], processed_org_A[0], None, None, processed_ref_B[1],
+                                           processed_org_A[1],
+                                           processed_ref_B[2], processed_org_A[2], generator=self.G)
+
+            fake_A_img = data2img(fake_A)
+            fake_B_img = data2img(fake_B)
+
+            processed_fake_A = preprocess_train_image(fake_A_img, processed_ref_B[1], processed_ref_B[2])
+            processed_fake_A = [self.to_var(item, requires_grad=False) for item in processed_fake_A]
+            processed_fake_B = preprocess_train_image(fake_B_img, processed_org_A[1], processed_org_A[2])
+            processed_fake_B = [self.to_var(item, requires_grad=False) for item in processed_fake_B]
+
+            rec_A = Solver_PSGAN.generate(processed_fake_A[0], processed_org_A[0], None, None, processed_fake_A[1],
+                                          processed_org_A[1],
+                                          processed_fake_A[2], processed_org_A[2], generator=self.G)
+            rec_B = Solver_PSGAN.generate(processed_fake_B[0], processed_ref_B[0], None, None, processed_fake_B[1],
+                                          processed_ref_B[1],
+                                          processed_fake_B[2], processed_ref_B[2], generator=self.G)
+
             time_total += time.time() - start
             image_list.append(fake_A)
             image_list_0.append(fake_A)
@@ -600,3 +663,57 @@ class Solver_PSGAN(object):
             save_image(self.de_norm(image_list_0.data), save_path_0, nrow=1, padding=0, normalize=True)
             print('Translated test images and saved into "{}"..!'.format(save_path))
         print("average time : {}".format(time_total / len(self.data_loader_test)))
+
+    @staticmethod
+    def generate(org_A, ref_B, lms_A=None, lms_B=None, mask_A=None, mask_B=None,
+                 diff_A=None, diff_B=None, gamma=None, beta=None, ret=False, generator=None, mode='train'):
+        """org_A is content, ref_B is style"""
+        G = generator
+        res = G.forward_atten(org_A, ref_B, mask_A, mask_B, diff_A, diff_B, gamma, beta, ret, mode)
+        return res
+
+    @staticmethod
+    def image_test(real_A, mask_A, diff_A, real_B, mask_B, diff_B, shade_alpha=1):
+        G = net.Generator()
+        G.load_state_dict(torch.load(pwd + '/pretrained_models/G.pth', map_location=torch.device('cpu')))
+        G.eval()
+
+        cur_prama = None
+        with torch.no_grad():
+            cur_prama = Solver_PSGAN.generate(real_A, real_B, None, None, mask_A, mask_B,
+                                              diff_A, diff_B, ret=True, generator=G, mode='test')
+            cur_prama_source = Solver_PSGAN.generate(real_A, real_A, None, None, mask_A, mask_A,
+                                                     diff_A, diff_A, ret=True, generator=G, mode='test')
+            shade_gamma = cur_prama[0] * shade_alpha + cur_prama_source[0] * (1 - shade_alpha)
+            shade_beta = cur_prama[1] * shade_alpha + cur_prama_source[1] * (1 - shade_alpha)
+            fake_A = Solver_PSGAN.generate(real_A, real_B, None, None, mask_A, mask_B,
+                                           diff_A, diff_B, gamma=shade_gamma, beta=shade_beta, generator=G, mode='test')
+        fake_A = data2img(fake_A)
+        return fake_A
+
+    @staticmethod
+    def partial_test(real_A, mask_aug_A, diff_A, real_B, mask_aug_B, diff_B, real_C, mask_aug_C, diff_C, mask2use,
+                     shade_alpha=1):
+        G = net.Generator()
+        G.load_state_dict(torch.load(pwd + '/G.pth', map_location=torch.device('cpu')))
+        G.eval()
+        with torch.no_grad():
+            cur_prama_B = Solver_PSGAN.generate(real_A, real_B, None, None, mask_aug_A, mask_aug_B,
+                                                diff_A, diff_B, ret=True, generator=G, mode='test')
+            cur_prama_C = Solver_PSGAN.generate(real_A, real_C, None, None, mask_aug_A, mask_aug_C,
+                                                diff_A, diff_C, ret=True, generator=G, mode='test')
+
+            cur_prama_source = Solver_PSGAN.generate(real_A, real_A, None, None, mask_aug_A, mask_aug_A,
+                                                     diff_A, diff_A, ret=True, generator=G, mode='test')
+
+            partial_gamma = cur_prama_B[0] * mask2use + cur_prama_C[0] * (1 - mask2use)
+            partial_beta = cur_prama_B[1] * mask2use + cur_prama_C[1] * (1 - mask2use)
+
+            partial_gamma = partial_gamma * shade_alpha + cur_prama_source[0] * (1 - shade_alpha)
+            partial_beta = partial_beta * shade_alpha + cur_prama_source[1] * (1 - shade_alpha)
+
+            fake_A = Solver_PSGAN.generate(real_A, real_B, None, None, mask_aug_A, mask2use,
+                                           diff_A, diff_B, gamma=partial_gamma, beta=partial_beta, ret=False,
+                                           generator=G, mode='test')
+        fake_A = data2img(fake_A)
+        return fake_A

@@ -2,6 +2,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.autograd import Variable
 from torchvision import transforms
+from torchvision.transforms import ToPILImage
 
 import faceutils as futils
 from ops.histogram_matching import *
@@ -110,12 +111,108 @@ def preprocess_image(image: Image):
     return [real, mask_aug, diff_re]
 
 
+def preprocess_makeup_gan(image: Image):
+    face = futils.dlib.detect(image)
+
+    assert face, "no faces detected"
+
+    # face[0]是第一个人脸，给定图片中只能有一个人脸
+    face = face[0]
+    image, face = futils.dlib.crop(image, face)
+
+    # detect landmark
+    lms = futils.dlib.landmarks(image, face) * 256 / image.width
+    lms = lms.round()
+    lms_eye_left = lms[42:48]
+    lms_eye_right = lms[36:42]
+
+    # obtain face parsing result
+    image = image.resize((512, 512), Image.ANTIALIAS)
+    mask = futils.mask.mask(image).resize((256, 256), Image.ANTIALIAS)
+    mask = to_var(ToTensor(mask).unsqueeze(0), requires_grad=False)
+    mask_lip = (mask == 7).float() + (mask == 9).float()
+    mask_face = (mask == 1).float() + (mask == 6).float()
+
+    # 需要抠出 mask_eye
+    mask_eyes = torch.zeros_like(mask)
+    copy_area(mask_eyes, mask_face, lms_eye_left)
+    copy_area(mask_eyes, mask_face, lms_eye_right)
+    mask_eyes = to_var(mask_eyes, requires_grad=False)
+
+    mask_list = [mask_lip, mask_face, mask_eyes]
+    mask_aug = mask_list[0]
+    for i, temp_mask in enumerate(mask_list):
+        if i > 0:
+            mask_aug = mask_aug + temp_mask
+    # mask_aug = torch.cat(mask_list, 0)  # (3, 1, h, w)
+
+    image = image.resize((256, 256), Image.ANTIALIAS)
+    real = to_var(transform(image).unsqueeze(0))
+    return [real, mask_aug]
+
+
 def preprocess_train_image(image: Image, mask, diff_re):
     real = transform(image).unsqueeze(0)
     mask_aug = mask
     diff_re = diff_re
 
     return [real, mask_aug, diff_re]
+
+
+def get_mask(image: Image, mask_lip_flag, mask_eye_flag, mask_face_flag):
+    face = futils.dlib.detect(image)
+
+    assert face, "no faces detected"
+
+    face = face[0]
+    image, face = futils.dlib.crop(image, face)
+
+    # detect landmark
+    lms = futils.dlib.landmarks(image, face) * 256 / image.width
+    lms = lms.round()
+    lms_eye_left = lms[42:48]
+    lms_eye_right = lms[36:42]
+
+    # obtain face parsing result
+    image = image.resize((512, 512), Image.ANTIALIAS)
+    current_mask = futils.mask.mask(image).resize((64, 64), Image.ANTIALIAS)
+    current_mask = to_var(ToTensor(current_mask).unsqueeze(0), requires_grad=False)
+    mask_lip = (current_mask == 7).float() + (current_mask == 9).float()
+    mask_face = (current_mask == 1).float() + (current_mask == 6).float()
+
+    mask_eyes = torch.zeros_like(current_mask)
+    copy_area(mask_eyes, mask_face, lms_eye_left)
+    copy_area(mask_eyes, mask_face, lms_eye_right)
+    mask_eyes = to_var(mask_eyes, requires_grad=False)
+
+    mask_list = []
+    if str(mask_lip_flag) == '1':
+        print('mask_lip_flag')
+        mask_list.append(mask_lip)
+    if str(mask_eye_flag) == '1':
+        print('mask_eye_flag')
+        mask_list.append(mask_eyes)
+        if str(mask_face_flag) != '1':
+            mask_list.append(mask_face)
+    if str(mask_face_flag) == '1':
+        print('mask_face_flag')
+        mask_list.append(mask_face)
+
+    mask2use = mask_list[0]
+    for i, current_mask in enumerate(mask_list):
+        if i > 0:
+            mask2use = mask2use + current_mask
+
+    return mask2use
+
+
+def data2img(gan_output):
+    fake_A_img = gan_output.cpu().clone().squeeze(0)
+    # normalize
+    min_, max_ = fake_A_img.min(), fake_A_img.max()
+    fake_A_img.add_(-min_).div_(max_ - min_ + 1e-5)
+    fake_A_img = ToPILImage()(fake_A_img)
+    return fake_A_img
 
 
 # parameter of eye transfer
