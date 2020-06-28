@@ -235,7 +235,9 @@ class AMM(nn.Module):
 
         if gamma is None:
             attention_map = self.raw_attention_map(fm_source, fm_reference)
-            gamma, beta = self.raw_atten_feature(mask_source, attention_map, old_gamma_matrix, old_beta_matrix, old_gamma_matrix_source, old_beta_matrix_source)
+            # gamma, beta = self.raw_atten_feature(mask_source, attention_map, old_gamma_matrix, old_beta_matrix,
+            #                                      old_gamma_matrix_source, old_beta_matrix_source)
+            gamma, beta = self.pure_atten_feature(attention_map, old_gamma_matrix, old_beta_matrix)
             if ret:
                 return [gamma, beta]
 
@@ -259,7 +261,8 @@ class AMM(nn.Module):
         return attention_map
 
     @staticmethod
-    def raw_atten_feature(mask_source, attention_map, old_gamma_matrix, old_beta_matrix, old_gamma_matrix_source, old_beta_matrix_source):
+    def raw_atten_feature(mask_source, attention_map, old_gamma_matrix, old_beta_matrix, old_gamma_matrix_source,
+                          old_beta_matrix_source):
         batch_size, channels, width, height = old_gamma_matrix.size()
         old_gamma_matrix = old_gamma_matrix.view(batch_size, -1, width * height)
         old_beta_matrix = old_beta_matrix.view(batch_size, -1, width * height)
@@ -268,9 +271,28 @@ class AMM(nn.Module):
         new_gamma_matrix = new_gamma_matrix.view(-1, 1, width, height)
         new_beta_matrix = new_beta_matrix.view(-1, 1, width, height)
 
+        reverse_mask_source = 1 - mask_source
         new_mask_source = F.interpolate(mask_source, size=new_gamma_matrix.shape[2:]).repeat(1, channels, 1, 1)
-        gamma = new_gamma_matrix * new_mask_source + old_gamma_matrix_source * (1 - new_mask_source)
-        beta = new_beta_matrix * new_mask_source + old_beta_matrix_source * (1 - new_mask_source)
+        new_reverse_mask_source = F.interpolate(reverse_mask_source, size=new_gamma_matrix.shape[2:]).repeat(1,
+                                                                                                             channels,
+                                                                                                             1, 1)
+        gamma = new_gamma_matrix * new_mask_source + old_gamma_matrix_source * new_reverse_mask_source
+        beta = new_beta_matrix * new_mask_source + old_beta_matrix_source * new_reverse_mask_source
+        return gamma, beta
+
+    # 只通过计算两个feature map的attention来修改gamma_matrix
+    @staticmethod
+    def pure_atten_feature(attention_map, old_gamma_matrix, old_beta_matrix):
+        batch_size, channels, width, height = old_gamma_matrix.size()
+        old_gamma_matrix = old_gamma_matrix.view(batch_size, -1, width * height)
+        old_beta_matrix = old_beta_matrix.view(batch_size, -1, width * height)
+        new_gamma_matrix = torch.bmm(old_gamma_matrix, attention_map.permute(0, 2, 1))
+        new_beta_matrix = torch.bmm(old_beta_matrix, attention_map.permute(0, 2, 1))
+        new_gamma_matrix = new_gamma_matrix.view(-1, 1, width, height)
+        new_beta_matrix = new_beta_matrix.view(-1, 1, width, height)
+
+        gamma = new_gamma_matrix
+        beta = new_beta_matrix
         return gamma, beta
 
     # 下面是PSGAN中计算attention的方法，但需要的显存太大，而且感觉有一些不合理的地方
